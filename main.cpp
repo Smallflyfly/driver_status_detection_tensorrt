@@ -20,6 +20,7 @@ using namespace nvinfer1;
 static Logger gLogger;
 
 #define INPUT_BLOB_NAME "input"
+#define OUTPUT_BLOB_NAME "output"
 #define INPUT_W 640
 #define INPUT_H 480
 
@@ -237,6 +238,32 @@ ILayer *convBNActivation(INetworkDefinition *network, map<string, Weights> weigh
     return hardWish;
 }
 
+// softmax layer
+ILayer *reshapeSoftmax(INetworkDefinition *network, ITensor &input, int c) {
+    IShuffleLayer *shuffleLayer1 = network->addShuffle(input);
+    assert(shuffleLayer1);
+    shuffleLayer1->setReshapeDimensions(Dims3{1, -1, c});
+
+    Dims dim0 = shuffleLayer1->getOutput(0)->getDimensions();
+
+    cout <<  "softmax output dims " << dim0.d[0] << " " << dim0.d[1] << " " << dim0.d[2] << " " << dim0.d[3] << endl;
+
+    ISoftMaxLayer *softMaxLayer = network->addSoftMax(*shuffleLayer1->getOutput(0));
+    assert(softMaxLayer);
+    softMaxLayer->setAxes(1<<2);
+
+    // 变为1维数组
+    Dims dim_{};
+    dim_.nbDims = 1;
+    dim_.d[0] = -1;
+
+    IShuffleLayer *shuffleLayer2 = network->addShuffle(*softMaxLayer->getOutput(0));
+    assert(shuffleLayer2);
+    shuffleLayer2->setReshapeDimensions(dim_);
+
+    return shuffleLayer2;
+}
+
 
 ICudaEngine *createEngine(IBuilder *builder, IBuilderConfig *config, DataType dataType, int maxBatchSize) {
     INetworkDefinition *network = builder->createNetworkV2(0U);
@@ -244,13 +271,63 @@ ICudaEngine *createEngine(IBuilder *builder, IBuilderConfig *config, DataType da
     ITensor *data = network->addInput(INPUT_BLOB_NAME, dataType, Dims3{maxBatchSize, INPUT_H, INPUT_W});
     assert(data);
 
-    map<string, Weights> weightMap = loadWeight("mobilev3_small.wts");
+    map<string, Weights> weightMap = loadWeight("driver_status_detection.wts");
 
     Weights emptyWt{DataType::kFLOAT, nullptr, 0};
 
     // construct network
     auto conv1 = convBNActivation(network, weightMap, *data, 16, 3, 2, "features.0");
-    auto ir1 = invertedResidual(network, weightMap, *conv1->getOutput(0), 16, 16, 3, 1, 16, false, false, )
+    auto ir1 = invertedResidual(network, weightMap, *conv1->getOutput(0), 16, 16, 3,
+                                2, 16, true, false, 56, "features.1.block");
+    auto ir2 = invertedResidual(network, weightMap, *ir1->getOutput(0), 16, 24, 3,
+                                2, 72, false, false, 28, "features.2.block");
+    auto ir3 = invertedResidual(network, weightMap, *ir2->getOutput(0), 24, 24, 3,
+                                1, 88, false, false, 28, "features.3.block");
+    auto ir4 = invertedResidual(network, weightMap, *ir3->getOutput(0), 24, 40, 5,
+                                2, 96, true, true, 14, "features.4.block");
+    auto ir5 = invertedResidual(network, weightMap, *ir4->getOutput(0), 40, 40, 5,
+                                1, 240, true, true, 14, "features.5.block");
+    auto ir6 = invertedResidual(network, weightMap, *ir5->getOutput(0), 40, 40, 5,
+                                1, 240, true, true, 14, "features.6.block");
+    auto ir7 = invertedResidual(network, weightMap, *ir6->getOutput(0), 40, 48, 5,
+                                1, 120, true, true, 14, "features.7.block");
+    auto ir8 = invertedResidual(network, weightMap, *ir7->getOutput(0), 48, 48, 5,
+                                1, 144, true, true, 14, "features.8.block");
+    auto ir9 = invertedResidual(network, weightMap, *ir8->getOutput(0), 48, 96, 5,
+                                2, 288, true, true, 7, "features.9.block");
+    auto ir10 = invertedResidual(network, weightMap, *ir9->getOutput(0), 576, 96, 5,
+                                 1, 96, true, true, 7, "features.10.block");
+    auto ir11 = invertedResidual(network, weightMap, *ir10->getOutput(0), 96, 96, 5,
+                                 1, 576, true, true, 7, "features.11.block");
+    auto conv2 = convBNActivation(network, weightMap, *ir11->getOutput(0), 6 * 96, 1, 1, "features.12");
+    auto pool = network->addPoolingNd(*conv2->getOutput(0), PoolingType::kAVERAGE, DimsHW{7 ,7});
+    assert(pool);
+    pool->setStrideNd(DimsHW{7, 7});
+
+    IFullyConnectedLayer *fc1 = network->addFullyConnected(*pool->getOutput(0), 1024, weightMap["classifier.0.weight"], weightMap["classifier.0.bias"]);
+    assert(fc1);
+    auto hardSwish = addHardWish(network, *fc1->getOutput(0));
+    // inference remove dropout
+    IFullyConnectedLayer *fc2 = network->addFullyConnected(*hardSwish->getOutput(0), 10, weightMap["classifier.3.weight"], weightMap["classifier.3.bias"]);
+
+    ILayer *softMaxLayer = reshapeSoftmax(network, *fc2->getOutput(0), 10);
+
+    softMaxLayer->getOutput(0)->setName(OUTPUT_BLOB_NAME);
+    cout << "set output name" << endl;
+    network->markOutput(*softMaxLayer->getOutput(0));
+
+    // build engine
+    builder->setMaxBatchSize(maxBatchSize);
+    config->setMaxWorkspaceSize(1 << 32);
+    ICudaEngine *engine = builder->buildEngineWithConfig(*network, *config);
+    cout << "engine build" << endl;
+
+    network->destroy();
+    for (auto &mem : weightMap) {
+        free((void *)(mem.second.values));
+    }
+
+    return engine;
 
 }
 
@@ -263,6 +340,13 @@ void APIToModel(IHostMemory **modelStream, int maxBatchSize) {
     ICudaEngine *engine;
 
     engine = createEngine(builder, config, DataType::kFLOAT, maxBatchSize);
+    assert(engine != nullptr);
+
+    (*modelStream) = engine->serialize();
+
+    engine->destroy();
+    builder->destroy();
+    config->destroy();
 }
 
 int main(int argc, char** argv){
@@ -276,5 +360,15 @@ int main(int argc, char** argv){
     if (string(argv[1])== "s") {
         IHostMemory *modelStream{nullptr};
         APIToModel(&modelStream, 1);
+        assert(modelStream != nullptr);
+        ofstream p("driver_status_detection.engine", ios::binary);
+        if (!p) {
+            cerr << "engine file error" << endl;
+            return -1;
+        }
+        p.write(reinterpret_cast<const char*>(modelStream->data()), modelStream->size());
+
+        modelStream->destroy();
+        return 0;
     }
 }

@@ -2,3 +2,4 @@ weights/
 *.pth
 *.engine
 cmake-build-debug/
+*.wts
