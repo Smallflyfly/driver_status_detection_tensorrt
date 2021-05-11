@@ -13,16 +13,21 @@
 #include <cmath>
 #include "cuda_runtime_api.h"
 
+#include "opencv2/core.hpp"
+#include "opencv2/imgproc.hpp"
+#include "opencv2/highgui.hpp"
 
 using namespace std;
 using namespace nvinfer1;
 
 static Logger gLogger;
 
-#define INPUT_BLOB_NAME "input"
-#define OUTPUT_BLOB_NAME "output"
-#define INPUT_W 640
-#define INPUT_H 480
+static const char* INPUT_BLOB_NAME = "input";
+static const char* OUTPUT_BLOB_NAME = "output";
+static const int INPUT_W = 640;
+static const int INPUT_H = 480;
+static const int BATCH_SIZE = 1;
+static const int OUTPUT_SIZE = 2;
 
 
 #define CHECK(status) \
@@ -331,7 +336,6 @@ ICudaEngine *createEngine(IBuilder *builder, IBuilderConfig *config, DataType da
 
 }
 
-
 void APIToModel(IHostMemory **modelStream, int maxBatchSize) {
     // create builder
     IBuilder *builder = createInferBuilder(gLogger);
@@ -347,6 +351,33 @@ void APIToModel(IHostMemory **modelStream, int maxBatchSize) {
     engine->destroy();
     builder->destroy();
     config->destroy();
+}
+
+void doInference(IExecutionContext &context, float *input, float *output, int batchSize) {
+    const ICudaEngine &engine = context.getEngine();
+    assert(engine.getNbBindings() == 2);
+    void *buffers[2];
+
+    const int inputIndex = engine.getBindingIndex(INPUT_BLOB_NAME);
+    const int outputIndex = engine.getBindingIndex(OUTPUT_BLOB_NAME);
+
+    // create GPU buffers on device
+    CHECK(cudaMalloc(&buffers[inputIndex], batchSize * 3 * INPUT_H * INPUT_W * sizeof(float)));
+    CHECK(cudaMalloc(&buffers[outputIndex], batchSize * OUTPUT_SIZE * sizeof(float)));
+
+    //create stream
+    cudaStream_t stream;
+    CHECK(cudaStreamCreate(&stream));
+
+    CHECK(cudaMemcpyAsync(buffers[inputIndex], input, batchSize * 3 * INPUT_H * INPUT_W * sizeof(float), cudaMemcpyHostToDevice, stream));
+    context.enqueue(batchSize, buffers, stream, nullptr);
+    CHECK(cudaMemcpyAsync(output, buffers[outputIndex], batchSize * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    cudaStreamSynchronize(stream);
+
+    //release stream and bufffers
+    cudaStreamDestroy(stream);
+    CHECK(cudaFree(buffers[inputIndex]));
+    CHECK(cudaFree(buffers[outputIndex]));
 }
 
 int main(int argc, char** argv){
@@ -370,5 +401,64 @@ int main(int argc, char** argv){
 
         modelStream->destroy();
         return 0;
+    } else {
+        ifstream file("driver_status_detection.engine", ios::binary);
+        if (file.good()) {
+            file.seekg(0, file.end);
+            size = file.tellg();
+            file.seekg(0, file.beg);
+            trtModelStream = new char [size];
+            assert(trtModelStream);
+            file.read(trtModelStream, size);
+            file.close();
+        }
     }
+    // input data
+    float data[BATCH_SIZE * 3 * INPUT_H * INPUT_W];
+    cv::Mat im = cv::imread("test.jpg");
+    if (im.empty()) {
+        cerr << "image file error" << endl;
+    }
+    cv::normalize(im, im, 1.0, 0.0, cv::NORM_MINMAX);
+//    float *p_data = &data[0];
+//    for (int i = 0; i < INPUT_H * INPUT_W; ++i) {
+//        p_data[i] = im.at<cv::Vec3b>(i)[0] / 255.0;
+//        p_data[i + INPUT_H * INPUT_W] = im.at<cv::Vec3b>(i)[1] / 255.0;
+//        p_data[i + 2 * INPUT_H * INPUT_W] = im.at<cv::Vec3b>(i)[2] / 255.0;
+//    }
+    unsigned vol = INPUT_H * INPUT_W * 3;
+    auto fileDataChar = (uchar *)malloc(BATCH_SIZE * 3 * INPUT_H * INPUT_W * sizeof(uchar));
+    fileDataChar = im.data;
+    for (int i = 0; i < vol; ++i) {
+        data[i] = (float)fileDataChar[i] * 1.0;
+    }
+
+    IRuntime *runtime = createInferRuntime(gLogger);
+    assert(runtime);
+
+    ICudaEngine *engine = runtime->deserializeCudaEngine(trtModelStream, size);
+    assert(engine);
+
+    IExecutionContext *context = engine->createExecutionContext();
+    assert(context);
+
+    delete[] trtModelStream;
+
+    // inference
+    float prob[BATCH_SIZE * OUTPUT_SIZE];
+    auto start = chrono::system_clock::now();
+    doInference(*context, data, prob, BATCH_SIZE);
+    auto end = chrono::system_clock::now();
+    cout << chrono::duration_cast<chrono::milliseconds>(end - start).count() << "ms" << endl;
+
+    //free engine
+    context->destroy();
+    engine->destroy();
+    runtime->destroy();
+
+    // output
+    for (int i = 0; i < OUTPUT_SIZE; ++i) {
+        cout << prob[i] << " ";
+    }
+    cout << endl;
 }
