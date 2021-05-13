@@ -165,6 +165,32 @@ ILayer *invertRes(INetworkDefinition *network, map<string, Weights> weightMap, I
     }
 }
 
+ILayer *softMaxImpl(INetworkDefinition *network, ITensor &input, int c) {
+    IShuffleLayer *shuffleLayer1 = network->addShuffle(input);
+    assert(shuffleLayer1);
+    shuffleLayer1->setReshapeDimensions(Dims3(1, -1, c));
+
+    Dims dim0 = shuffleLayer1->getOutput(0)->getDimensions();
+
+    cout << "softmax dims " << dim0.d[0] << " " << dim0.d[1] << " " << dim0.d[2] << " " << dim0.d[3] << endl;
+
+    ISoftMaxLayer *softMaxLayer = network->addSoftMax(*shuffleLayer1->getOutput(0));
+    assert(softMaxLayer);
+    softMaxLayer->setAxes(1 << 2);
+
+    // 1-dim
+    Dims dim_;
+    dim_.nbDims = 1;
+    dim_.d[0] = -1;
+
+    IShuffleLayer *shuffleLayer2 = network->addShuffle(*softMaxLayer->getOutput(0));
+    assert(shuffleLayer2);
+    shuffleLayer2->setReshapeDimensions(dim_);
+
+    return shuffleLayer2;
+
+}
+
 ICudaEngine *createEngine(IBuilder *builder, IBuilderConfig *config, int maxBatchSize) {
     INetworkDefinition *network = builder->createNetworkV2(0U);
     assert(network != nullptr);
@@ -213,9 +239,15 @@ ICudaEngine *createEngine(IBuilder *builder, IBuilderConfig *config, int maxBatc
     IFullyConnectedLayer *fc = network->addFullyConnected(*pool->getOutput(0), 10, weightMap["classifier.1.weight"], weightMap["classifier.1.bias"]);
     assert(fc);
 
-    fc->getOutput(0)->setName(OUTPUT_BLOB_NAME);
-    cout << "set output name." << endl;
-    network->markOutput(*fc->getOutput(0));
+//    fc->getOutput(0)->setName(OUTPUT_BLOB_NAME);
+//    cout << "set output name." << endl;
+//    network->markOutput(*fc->getOutput(0));
+
+    // add softmax layer
+    ILayer *softmaxLayer = softMaxImpl(network, *fc->getOutput(0), OUTPUT_SIZE);
+    // set output name
+    softmaxLayer->getOutput(0)->setName(OUTPUT_BLOB_NAME);
+    network->markOutput(*softmaxLayer->getOutput(0));
 
     // build engine
     builder->setMaxBatchSize(maxBatchSize);
@@ -321,6 +353,11 @@ int main (int argc, char** argv) {
             return -1;
         }
     }
+
+    vector<string> classes = {
+            "normal driving", "texting - right", "talking on the phone - right", "texting - left", "talking on the phone - left",
+            "operating the radio", "drinking", "reaching behind", "hair and makeup", "talking to passenger"
+    };
     static float data[3 * INPUT_H * INPUT_W];
     for (float & i : data) {
         i = 1.0;
@@ -337,11 +374,15 @@ int main (int argc, char** argv) {
 //    for (int i = 0; i < vol; ++i) {
 //        data[i] = (float)fileDataChar[i] * 1.0;
 //    }
+
+    // mean std [0.33708435, 0.42723662, 0.41629601] [0.2618102, 0.31948383, 0.33079577]
+    float mean[3] = {0.33708435, 0.42723662, 0.41629601};
+    float std[3] = {0.2618102, 0.31948383, 0.33079577};
     float *pData = &data[0];
     for (int i = 0; i < INPUT_H * INPUT_W; ++i) {
-        pData[i] = im.at<cv::Vec3b>(i)[0] / 255.0;
-        pData[i + INPUT_H * INPUT_W] = im.at<cv::Vec3b>(i)[1] / 255.0;
-        pData[i + 2 * INPUT_H * INPUT_W] = im.at<cv::Vec3b>(i)[2] / 255.0;
+        pData[i] = (float)(im.at<cv::Vec3b>(i)[2] / 255.0 - mean[2]) / std[2];
+        pData[i + INPUT_H * INPUT_W] = float(im.at<cv::Vec3b>(i)[1] / 255.0 - mean[1]) / std[1];
+        pData[i + 2 * INPUT_H * INPUT_W] = float(im.at<cv::Vec3b>(i)[0] / 255.0 - mean[0]) / std[0];
     }
 
     IRuntime *runtime = createInferRuntime(gLogger);
@@ -361,5 +402,28 @@ int main (int argc, char** argv) {
     doInference(*context, data, prob, 1);
     auto end  = chrono::system_clock::now();
     cout << chrono::duration_cast<chrono::milliseconds>(end - start).count() << "ms" << endl;
+
+    cout << "inference output" << endl;
+
+    float maxProb = 0.0;
+    int idx = -1;
+    for (int i = 0; i < OUTPUT_SIZE - 1; ++i) {
+        cout << prob[i] << ",";
+        if (maxProb < prob[i]) {
+            maxProb = prob[i];
+            idx = i;
+        }
+    }
+    cout << prob[OUTPUT_SIZE - 1] << endl;
+    cout << "classes: " << classes[idx] << " " << "prob: " << maxProb << endl;
+
+    cv::putText(im, classes[idx], cv::Point2d(10, INPUT_H - 40), cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(0, 0, 255));
+    cv::putText(im, to_string(maxProb), cv::Point2d(10, INPUT_H - 20), cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(0, 0, 255));
+
+    cv::imshow("driver_status_detection", im);
+
+    cv::waitKey();
+    cv::destroyAllWindows();
+
     return 0;
 }

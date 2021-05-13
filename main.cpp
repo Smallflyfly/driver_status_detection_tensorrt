@@ -27,7 +27,7 @@ static const char* OUTPUT_BLOB_NAME = "output";
 static const int INPUT_W = 640;
 static const int INPUT_H = 480;
 static const int BATCH_SIZE = 1;
-static const int OUTPUT_SIZE = 2;
+static const int OUTPUT_SIZE = 10;
 
 
 #define CHECK(status) \
@@ -58,6 +58,9 @@ map<string, Weights> loadWeight(const string& weightFile) {
         input >> name >> dec >> size;
         wt.type = DataType::kFLOAT;
         wt.count = size;
+        if (size == 432) {
+            cout << name << endl;
+        }
         // val
         uint32_t  *val = reinterpret_cast<uint32_t*>(malloc(sizeof(val) * size));
         for (uint32_t i = 0; i < size; i++) {
@@ -79,16 +82,22 @@ IScaleLayer *addBN(INetworkDefinition *network, map<string, Weights> weightMap, 
 
     int len = weightMap[layerName + ".running_var"].count;
     float *scval = reinterpret_cast<float*>(malloc(sizeof(float) * len));
-    float *shval = reinterpret_cast<float*>(malloc(sizeof(float ) * len));
+    float *shval = reinterpret_cast<float*>(malloc(sizeof(float) * len));
     float *pval = reinterpret_cast<float*>(malloc(sizeof(float) * len));
 
     for (int i = 0; i < len; ++i) {
         scval[i] = gamma[i] / sqrt(var[i] + eps);
-        shval[i] = bias[i] - mean[i] * gamma[i] / sqrt(var[i] + eps);
-        pval[i] = 1.0;
     }
     Weights scale{DataType::kFLOAT, scval, len};
+
+    for (int i = 0; i < len; ++i) {
+        shval[i] = bias[i] - mean[i] * gamma[i] / sqrt(var[i] + eps);
+    }
     Weights shift{DataType::kFLOAT, shval, len};
+
+    for (int i = 0; i < len; ++i) {
+        pval[i] = 1.0;
+    }
     Weights power{DataType::kFLOAT, pval, len};
 
     weightMap[layerName + ".scale"] = scale;
@@ -101,7 +110,7 @@ IScaleLayer *addBN(INetworkDefinition *network, map<string, Weights> weightMap, 
     return bn;
 }
 
-ILayer *addHardWish(INetworkDefinition *network, ITensor &input) {
+ILayer *addHardSwish(INetworkDefinition *network, ITensor &input) {
     IActivationLayer *hardSigmoid = network->addActivation(input, ActivationType::kHARD_SIGMOID);
     assert(hardSigmoid);
     hardSigmoid->setAlpha(1.0 / 6.0);
@@ -112,13 +121,20 @@ ILayer *addHardWish(INetworkDefinition *network, ITensor &input) {
     return ew;
 }
 
-ILayer *seLayer(INetworkDefinition *network, map<string, Weights>weightMap, ITensor &input, int expandCh, int w, string layerName) {
-    int h = w;
+ILayer *seLayer(INetworkDefinition *network, map<string, Weights>weightMap, ITensor &input, int expandCh, int w, int h, string layerName) {
     IPoolingLayer *pool = network->addPoolingNd(input, PoolingType::kAVERAGE, DimsHW{h, w});
     assert(pool);
     pool->setStrideNd(DimsHW{h ,w});
 
-    IConvolutionLayer *fc1 = network->addConvolutionNd(*pool->getOutput(0), expandCh/4, DimsHW{1, 1},
+    // ensure outCh % 8 == 0
+    int outCh = max(expandCh / 4, 8);
+    if (outCh % 8 != 0) {
+        int mod = outCh % 8;
+        outCh += (8 - mod);
+    }
+    assert(outCh % 8 == 0 && "seLayer outChannel wrong");
+
+    IConvolutionLayer *fc1 = network->addConvolutionNd(*pool->getOutput(0), outCh, DimsHW{1, 1},
                                                        weightMap[layerName + ".fc1.weight"], weightMap[layerName + ".fc1.bias"]);
     assert(fc1);
     IActivationLayer *relu = network->addActivation(*fc1->getOutput(0), ActivationType::kRELU);
@@ -138,53 +154,67 @@ ILayer *seLayer(INetworkDefinition *network, map<string, Weights>weightMap, ITen
 }
 
 ILayer *seq1(INetworkDefinition *network, map<string, Weights> &weightMap, ITensor &input, int outCh, int expandCh, int kSize,
-             int stride, bool useSE, bool useHS, int w, string layerName) {
+             int stride, bool useSE, bool useHS, int w, int h, string layerName) {
     Weights emptyWt{DataType::kFLOAT, nullptr, 0};
     IConvolutionLayer *conv1 = network->addConvolutionNd(input, expandCh, DimsHW{1, 1}, weightMap[layerName + ".0.0.weight"], emptyWt);
     assert(conv1);
-    conv1->setStrideNd(DimsHW{1, 1});
-    conv1->setNbGroups(1);
-
     IScaleLayer *bn1 = addBN(network, weightMap, *conv1->getOutput(0), layerName + ".0.1", 1e-5);
-    ILayer *act1;
+    ITensor *actTensor;
     if (useHS) {
         // hard swish
-        act1 = addHardWish(network, *bn1->getOutput(0));
+        ILayer *act1 = addHardSwish(network, *bn1->getOutput(0));
+        actTensor = act1->getOutput(0);
     } else {
         // relu
-        act1 = network->addActivation(*bn1->getOutput(0), ActivationType::kRELU);
+        ILayer *act1 = network->addActivation(*bn1->getOutput(0), ActivationType::kRELU);
         assert(act1);
+        actTensor = act1->getOutput(0);
     }
     int p = (kSize - 1 ) / 2 * 1;
-    IConvolutionLayer *conv2 = network->addConvolutionNd(*act1->getOutput(0), expandCh, DimsHW{kSize, kSize}, weightMap[layerName + ".1.0.weight"],emptyWt);
+    IConvolutionLayer *conv2 = network->addConvolutionNd(*actTensor, expandCh, DimsHW{kSize, kSize}, weightMap[layerName + ".1.0.weight"],emptyWt);
     assert(conv2);
     conv2->setStrideNd(DimsHW{stride, stride});
     conv2->setPaddingNd(DimsHW{p, p});
     conv2->setNbGroups(expandCh);
     IScaleLayer *bn2 = addBN(network, weightMap, *conv2->getOutput(0), layerName + ".1.1", 1e-5);
-    ILayer *act2;
+    ITensor *hsTensor;
+    hsTensor = nullptr;
     if (useHS) {
         // hard swish
-        act2 = addHardWish(network, *bn2->getOutput(0));
+        ILayer *act2 = addHardSwish(network, *bn2->getOutput(0));
+        hsTensor = act2->getOutput(0);
     } else {
         // relu
-        act2 = network->addActivation(*bn2->getOutput(0), ActivationType::kRELU);
+        ILayer *act2 = network->addActivation(*bn2->getOutput(0), ActivationType::kRELU);
         assert(act2);
+        hsTensor = act2->getOutput(0);
     }
-    ITensor &tensor = *act2->getOutput(0);
+    ITensor *tensor;
+    tensor = nullptr;
     if (useSE) {
-        ILayer *se = seLayer(network, weightMap, *act2->getOutput(0), expandCh, w, layerName + ".2");
-        tensor = *se->getOutput(0);
+        ILayer *se = seLayer(network, weightMap, *hsTensor, expandCh, w, h, layerName + ".2");
+        tensor = se->getOutput(0);
+    } else {
+        tensor = hsTensor;
     }
-    IConvolutionLayer *conv3 = network->addConvolutionNd(tensor, outCh, DimsHW{1, 1}, weightMap[layerName + ".3.0.weight"], emptyWt);
+    string convName;
+    string bnName;
+    if (useSE) {
+        convName = ".3.0.weight";
+        bnName = ".3.1";
+    } else {
+        convName = ".2.0.weight";
+        bnName = ".2.1";
+    }
+    IConvolutionLayer *conv3 = network->addConvolutionNd(*tensor, outCh, DimsHW{1, 1}, weightMap[layerName + convName], emptyWt);
     assert(conv3);
-    IScaleLayer *bn3 = addBN(network, weightMap, *conv3->getOutput(0), layerName + ".3.1", 1e-5);
+    IScaleLayer *bn3 = addBN(network, weightMap, *conv3->getOutput(0), layerName + bnName, 1e-5);
 
     return bn3;
 }
 
 ILayer *seq2(INetworkDefinition *network, map<string, Weights>weightMap, ITensor &input, int outCh, int expandCh, int kSize,
-             int stride, bool useSE, bool useHS, int w, string layerName) {
+             int stride, bool useSE, bool useHS, int w, int h, string layerName) {
     Weights emptyWt{DataType::kFLOAT, nullptr, 0};
     int p = (kSize - 1) / 2;
     IConvolutionLayer *conv1 = network->addConvolutionNd(input, expandCh, DimsHW{kSize, kSize}, weightMap[layerName + ".0.0.weight"], emptyWt);
@@ -193,18 +223,23 @@ ILayer *seq2(INetworkDefinition *network, map<string, Weights>weightMap, ITensor
     conv1->setNbGroups(expandCh);
     conv1->setPaddingNd(DimsHW{p, p});
     IScaleLayer *bn1 = addBN(network, weightMap, *conv1->getOutput(0), layerName + ".0.1", 1e-5);
-    ILayer *act1;
+    ITensor *actTensor;
     if (useHS) {
-        act1 = addHardWish(network, *bn1->getOutput(0));
+        ILayer *act1 = addHardSwish(network, *bn1->getOutput(0));
+        actTensor = act1->getOutput(0);
     } else {
-        act1 = network->addActivation(*bn1->getOutput(0), ActivationType::kRELU);
+        IActivationLayer *relu = network->addActivation(*bn1->getOutput(0), ActivationType::kRELU);
+        actTensor = relu->getOutput(0);
     }
-    ITensor &tensor = *act1->getOutput(0);
+    ITensor *tensor;
+    tensor = nullptr;
     if (useSE) {
-        ILayer *se = seLayer(network, weightMap, *act1->getOutput(0), expandCh, w, layerName + ".1");
-        tensor = *se->getOutput(0);
+        ILayer *se = seLayer(network, weightMap, *actTensor, expandCh, w, h,layerName + ".1");
+        tensor = se->getOutput(0);
+    } else {
+        tensor = actTensor;
     }
-    IConvolutionLayer *conv2 = network->addConvolutionNd(tensor, outCh, DimsHW{1, 1}, weightMap[layerName + ".2.0.weight"], emptyWt);
+    IConvolutionLayer *conv2 = network->addConvolutionNd(*tensor, outCh, DimsHW{1, 1}, weightMap[layerName + ".2.0.weight"], emptyWt);
     assert(conv2);
     IScaleLayer *bn2 = addBN(network, weightMap, *conv2->getOutput(0), layerName + ".2.1", 1e-5);
 
@@ -212,33 +247,33 @@ ILayer *seq2(INetworkDefinition *network, map<string, Weights>weightMap, ITensor
 }
 
 ILayer *invertedResidual(INetworkDefinition *network, map<string, Weights>weightMap, ITensor &input, int inCh, int outCh,
-                         int kSize, int stride, int expandCh, bool useSE, bool useHS, int w, string layerName) {
-    bool useResConnect = stride == 1 && inCh == outCh;
+                         int kSize, int stride, int expandCh, bool useSE, bool useHS, int w, int h, string layerName) {
+    bool useResConnect = (stride == 1 && inCh == outCh);
     ILayer *conv;
     if (expandCh != inCh) {
-        conv = seq1(network, weightMap, input, outCh, expandCh, kSize, stride, useSE, useHS, w, layerName);
+        conv = seq1(network, weightMap, input, outCh, expandCh, kSize, stride, useSE, useHS, w, h,layerName);
     } else {
-        conv = seq2(network, weightMap, input, outCh, expandCh, kSize, stride, useSE, useHS, w, layerName);
+        conv = seq2(network, weightMap, input, outCh, expandCh, kSize, stride, useSE, useHS, w, h,layerName);
     }
     if (useResConnect) {
-        IElementWiseLayer *ew = network->addElementWise(*conv->getOutput(0), input, ElementWiseOperation::kSUM);
+        IElementWiseLayer *ew = network->addElementWise( input, *conv->getOutput(0), ElementWiseOperation::kSUM);
         return ew;
     }
     return conv;
 }
 
-ILayer *convBNActivation(INetworkDefinition *network, map<string, Weights> weightMap, ITensor &input, int outCh, int kSize, int stride, const string layerName, int g=1,  int dilation=1) {
+ILayer *convBNActivation(INetworkDefinition *network, map<string, Weights> weightMap, ITensor &input, int outCh, int kSize, int stride, const string layerName) {
     Weights empytWt{DataType::kFLOAT, nullptr, 0};
-    int p = (kSize - 1) / 2 * dilation;
+    int p = (kSize - 1) / 2 * 1;
     IConvolutionLayer *conv1 = network->addConvolutionNd(input, outCh, DimsHW{kSize, kSize}, weightMap[layerName + ".0.weight"], empytWt);
     assert(conv1);
     conv1->setStrideNd(DimsHW{stride, stride});
     conv1->setPaddingNd(DimsHW{p, p});
-    conv1->setNbGroups(g);
+    conv1->setNbGroups(1);
 
     IScaleLayer *bn = addBN(network, weightMap, *conv1->getOutput(0), layerName+".1", 1e-5);
 
-    ILayer *hardWish = addHardWish(network, *bn->getOutput(0));
+    ILayer *hardWish = addHardSwish(network, *bn->getOutput(0));
 
     return hardWish;
 }
@@ -273,7 +308,7 @@ ILayer *reshapeSoftmax(INetworkDefinition *network, ITensor &input, int c) {
 ICudaEngine *createEngine(IBuilder *builder, IBuilderConfig *config, DataType dataType, int maxBatchSize) {
     INetworkDefinition *network = builder->createNetworkV2(0U);
 
-    ITensor *data = network->addInput(INPUT_BLOB_NAME, dataType, Dims3{maxBatchSize, INPUT_H, INPUT_W});
+    ITensor *data = network->addInput(INPUT_BLOB_NAME, dataType, Dims3{3, INPUT_H, INPUT_W});
     assert(data);
 
     map<string, Weights> weightMap = loadWeight("driver_status_detection.wts");
@@ -283,48 +318,54 @@ ICudaEngine *createEngine(IBuilder *builder, IBuilderConfig *config, DataType da
     // construct network
     auto conv1 = convBNActivation(network, weightMap, *data, 16, 3, 2, "features.0");
     auto ir1 = invertedResidual(network, weightMap, *conv1->getOutput(0), 16, 16, 3,
-                                2, 16, true, false, 56, "features.1.block");
+                                2, 16, true, false, 160, 120, "features.1.block");
     auto ir2 = invertedResidual(network, weightMap, *ir1->getOutput(0), 16, 24, 3,
-                                2, 72, false, false, 28, "features.2.block");
+                                2, 72, false, false, 80, 60, "features.2.block");
     auto ir3 = invertedResidual(network, weightMap, *ir2->getOutput(0), 24, 24, 3,
-                                1, 88, false, false, 28, "features.3.block");
+                                1, 88, false, false, 80, 60, "features.3.block");
     auto ir4 = invertedResidual(network, weightMap, *ir3->getOutput(0), 24, 40, 5,
-                                2, 96, true, true, 14, "features.4.block");
+                                2, 96, true, true, 40, 30, "features.4.block");
     auto ir5 = invertedResidual(network, weightMap, *ir4->getOutput(0), 40, 40, 5,
-                                1, 240, true, true, 14, "features.5.block");
+                                1, 240, true, true, 40, 30, "features.5.block");
     auto ir6 = invertedResidual(network, weightMap, *ir5->getOutput(0), 40, 40, 5,
-                                1, 240, true, true, 14, "features.6.block");
+                                1, 240, true, true, 40, 30, "features.6.block");
     auto ir7 = invertedResidual(network, weightMap, *ir6->getOutput(0), 40, 48, 5,
-                                1, 120, true, true, 14, "features.7.block");
+                                1, 120, true, true, 40, 30, "features.7.block");
     auto ir8 = invertedResidual(network, weightMap, *ir7->getOutput(0), 48, 48, 5,
-                                1, 144, true, true, 14, "features.8.block");
+                                1, 144, true, true, 40, 30, "features.8.block");
     auto ir9 = invertedResidual(network, weightMap, *ir8->getOutput(0), 48, 96, 5,
-                                2, 288, true, true, 7, "features.9.block");
-    auto ir10 = invertedResidual(network, weightMap, *ir9->getOutput(0), 576, 96, 5,
-                                 1, 96, true, true, 7, "features.10.block");
+                                2, 288, true, true, 20, 15, "features.9.block");
+    auto ir10 = invertedResidual(network, weightMap, *ir9->getOutput(0), 96, 96, 5,
+                                 1, 576, true, true, 20, 15, "features.10.block");
     auto ir11 = invertedResidual(network, weightMap, *ir10->getOutput(0), 96, 96, 5,
-                                 1, 576, true, true, 7, "features.11.block");
-    auto conv2 = convBNActivation(network, weightMap, *ir11->getOutput(0), 6 * 96, 1, 1, "features.12");
-    auto pool = network->addPoolingNd(*conv2->getOutput(0), PoolingType::kAVERAGE, DimsHW{7 ,7});
+                                 1, 576, true, true, 20, 15, "features.11.block");
+    auto conv2 = convBNActivation(network, weightMap, *ir11->getOutput(0), 576, 1, 1, "features.12");
+    auto pool = network->addPoolingNd(*conv2->getOutput(0), PoolingType::kAVERAGE, DimsHW{15 ,20});
     assert(pool);
-    pool->setStrideNd(DimsHW{7, 7});
+    pool->setStrideNd(DimsHW{15, 20});
 
     IFullyConnectedLayer *fc1 = network->addFullyConnected(*pool->getOutput(0), 1024, weightMap["classifier.0.weight"], weightMap["classifier.0.bias"]);
     assert(fc1);
-    auto hardSwish = addHardWish(network, *fc1->getOutput(0));
+    auto hardSwish = addHardSwish(network, *fc1->getOutput(0));
     // inference remove dropout
     IFullyConnectedLayer *fc2 = network->addFullyConnected(*hardSwish->getOutput(0), 10, weightMap["classifier.3.weight"], weightMap["classifier.3.bias"]);
 
     ILayer *softMaxLayer = reshapeSoftmax(network, *fc2->getOutput(0), 10);
-
     softMaxLayer->getOutput(0)->setName(OUTPUT_BLOB_NAME);
     cout << "set output name" << endl;
     network->markOutput(*softMaxLayer->getOutput(0));
 
+//    fc2->getOutput(0)->setName(OUTPUT_BLOB_NAME);
+//    cout << "set output name" << endl;
+//    network->markOutput(*fc2->getOutput(0));
+
+
+
     // build engine
     builder->setMaxBatchSize(maxBatchSize);
-    config->setMaxWorkspaceSize(1 << 32);
+    config->setMaxWorkspaceSize(1 << 20);
     ICudaEngine *engine = builder->buildEngineWithConfig(*network, *config);
+    assert(engine);
     cout << "engine build" << endl;
 
     network->destroy();
@@ -388,7 +429,7 @@ int main(int argc, char** argv){
     char *trtModelStream{nullptr};
     size_t size{0};
 
-    if (string(argv[1])== "s") {
+    if (string(argv[1])== "-s") {
         IHostMemory *modelStream{nullptr};
         APIToModel(&modelStream, 1);
         assert(modelStream != nullptr);
@@ -415,7 +456,7 @@ int main(int argc, char** argv){
     }
     // input data
     float data[BATCH_SIZE * 3 * INPUT_H * INPUT_W];
-    cv::Mat im = cv::imread("test.jpg");
+    cv::Mat im = cv::imread("img_1.jpg");
     if (im.empty()) {
         cerr << "image file error" << endl;
     }
