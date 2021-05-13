@@ -32,19 +32,20 @@
 using namespace std;
 using namespace nvinfer1;
 
-static const Logger gLogger;
+static Logger gLogger;
 static const char* INPUT_BLOB_NAME = "input";
 static const char* OUTPUT_BLOB_NAME = "output";
 static const int INPUT_W = 640;
 static const int INPUT_H = 480;
+static const int OUTPUT_SIZE = 10;
 
 
 map<string, Weights> loadWeight(const string &weightFile) {
     cout << "Loading weight" << endl;
     map<string, Weights> weightMap;
 
-    ifstream f(weightFile);
-    assert(f.is_open() && "unable to load weight file");
+    ifstream input(weightFile);
+    assert(input.is_open() && "unable to load weight file");
 
     int count = 0;
     input >> count;
@@ -55,7 +56,7 @@ map<string, Weights> loadWeight(const string &weightFile) {
         int size;
         string name;
         input >> name >> dec >> size;
-        uint32_t *val = reinterpret_cast<uint32_t*>(malloc(uint32_t) * size);
+        uint32_t *val = reinterpret_cast<uint32_t*>(malloc(sizeof(val) * size));
         for (int i = 0; i < size; ++i) {
             input >> hex >> val[i];
         }
@@ -106,11 +107,11 @@ ILayer *convBNReLU(INetworkDefinition *network, map<string, Weights> weightMap, 
     conv->setPaddingNd(DimsHW{p, p});
     conv->setNbGroups(g);
 
-    IScaleLayer *bn = addBN2d(network, *conv->getOutput(0), weightMap, layerName + ".1", 1e-5);
+    IScaleLayer *bn = addBN2d(network, *conv->getOutput(0 ), weightMap, layerName + ".1", 1e-5);
 
     // relu 6
     IActivationLayer *relu1 = network->addActivation(*bn->getOutput(0), ActivationType::kRELU);
-    assert(relu);
+    assert(relu1);
 
     float *shval = reinterpret_cast<float*>(malloc(sizeof(float ) * 1));
     float *scval = reinterpret_cast<float*>(malloc(sizeof(float) * 1));
@@ -122,7 +123,7 @@ ILayer *convBNReLU(INetworkDefinition *network, map<string, Weights> weightMap, 
     Weights scale{DataType::kFLOAT, scval, 1};
     Weights power{DataType::kFLOAT, pval, 1};
 
-    IScaleLayer *scaleRelu = network->addScale(*relu1->getOutput(0), ScaleMode::kUNIFORM, shift, scale, power);
+    IScaleLayer *scaleRelu = network->addScale(*bn->getOutput(0), ScaleMode::kUNIFORM, shift, scale, power);
     assert(scaleRelu);
 
     IActivationLayer *relu2 = network->addActivation(*scaleRelu->getOutput(0), ActivationType::kRELU);
@@ -141,18 +142,18 @@ ILayer *invertRes(INetworkDefinition *network, map<string, Weights> weightMap, I
 //    ITensor *tensor = nullptr;
     IScaleLayer *bn = nullptr;
     if (expandRatio != 1) {
-        ILayer *conv1 = convBNReLU(network, weightMap, input, hiddenDim, 3, 1, 1, layerName + ".conv.0");
+        ILayer *conv1 = convBNReLU(network, weightMap, input, hiddenDim, 1, 1, 1, layerName + ".conv.0");
         ILayer *conv2 = convBNReLU(network,weightMap, *conv1->getOutput(0), hiddenDim, 3, stride, hiddenDim, layerName + ".conv.1");
         IConvolutionLayer *conv3 = network->addConvolutionNd(*conv2->getOutput(0), outCh, DimsHW{1, 1}, weightMap[layerName + ".conv.2.weight"], emptyWt);
         assert(conv3);
-        *bn = addBN2d(network, *conv3->getOutput(0), weightMap, layerName[layerName + ".conv.3"], 1e-5);
+        bn = addBN2d(network, *conv3->getOutput(0), weightMap, layerName + ".conv.3", 1e-5);
 //        tensor = *bn->getOutput(0);
 
     } else {
         ILayer *conv1 = convBNReLU(network, weightMap, input, hiddenDim, 3, stride, hiddenDim, layerName + ".conv.0");
-        IConvolutionLayer *conv2 = network->addConvolutionNd(*conv1->getOutput(0), outCh, DimsHW{1. 1}, weightMap[layerName + "conv.1.weight"], emptyWt);
+        IConvolutionLayer *conv2 = network->addConvolutionNd(*conv1->getOutput(0), outCh, DimsHW{1, 1}, weightMap[layerName + ".conv.1.weight"], emptyWt);
         assert(conv2);
-        *bn = addBN2d(network, *conv2->getOutput(0), weightMap, layerName + ".conv.2");
+        bn = addBN2d(network, *conv2->getOutput(0), weightMap, layerName + ".conv.2", 1e-5);
 //        tensor = bn->getOutput(0);
     }
     if (useResConnect) {
@@ -166,12 +167,12 @@ ILayer *invertRes(INetworkDefinition *network, map<string, Weights> weightMap, I
 ICudaEngine *createEngine(IBuilder *builder, IBuilderConfig *config, int maxBatchSize) {
     INetworkDefinition *network = builder->createNetworkV2(0U);
     assert(network != nullptr);
-    ITensor *data = network->addInput(INPUT_BLOB_NAME, DataType::kFLOAT, Dims{3 * INPUT_W * INPUT_H});
+    ITensor *data = network->addInput(INPUT_BLOB_NAME, DataType::kFLOAT, Dims3{3, INPUT_H, INPUT_W});
     assert(data);
 
     map<string, Weights> weightMap = loadWeight("driver_status_detection_mobile_v2.wts");
 
-    auto conv1 = convBNReLU(network, weightMap, data, 32, 3, 2, 1, "features.0");
+    auto conv1 = convBNReLU(network, weightMap, *data, 32, 3, 2, 1, "features.0");
     // [1, 16, 1, 1] t c n s
     auto ir1 = invertRes(network, weightMap, *conv1->getOutput(0), 32, 16, 1, 1, "features.1");
 
@@ -206,6 +207,7 @@ ICudaEngine *createEngine(IBuilder *builder, IBuilderConfig *config, int maxBatc
     ILayer *conv2 = convBNReLU(network, weightMap, *ir17->getOutput(0), 1280, 1, 1, 1, "features.18");
     IPoolingLayer *pool = network->addPoolingNd(*conv2->getOutput(0), PoolingType::kAVERAGE, DimsHW{15, 20});
     assert(pool);
+    pool->setStrideNd(DimsHW{15, 20});
 
     IFullyConnectedLayer *fc = network->addFullyConnected(*pool->getOutput(0), 10, weightMap["classifier.1.weight"], weightMap["classifier.1.bias"]);
     assert(fc);
@@ -231,7 +233,7 @@ ICudaEngine *createEngine(IBuilder *builder, IBuilderConfig *config, int maxBatc
 }
 
 
-void APIToModel(IHostMemory *modelStream, int maxBatchSize) {
+void APIToModel(IHostMemory **modelStream, int maxBatchSize) {
     // create builder
     IBuilder *builder = createInferBuilder(gLogger);
 
@@ -239,7 +241,7 @@ void APIToModel(IHostMemory *modelStream, int maxBatchSize) {
     IBuilderConfig * config = builder->createBuilderConfig();
 
     // engine
-    ICudaEngine *engine = createEngine(*builder, *config, maxBatchSize);
+    ICudaEngine *engine = createEngine(builder, config, maxBatchSize);
     assert(engine != nullptr);
 
     (*modelStream) = engine->serialize();
@@ -249,12 +251,41 @@ void APIToModel(IHostMemory *modelStream, int maxBatchSize) {
     config->destroy();
 }
 
+void doInference(IExecutionContext &context, float *input, float *output, int batchSize) {
+    const ICudaEngine &engine = context.getEngine();
 
-int main (int argc, char* argv) {
+    assert(engine.getNbBindings() == 2);
+    void *buffers[2];
+
+    const int inputIndex = engine.getBindingIndex(INPUT_BLOB_NAME);
+    const int outputIndex = engine.getBindingIndex(OUTPUT_BLOB_NAME);
+
+    CHECK(cudaMalloc(&buffers[inputIndex], batchSize * 3 * INPUT_H * INPUT_W * sizeof(float)));
+    CHECK(cudaMalloc(&buffers[outputIndex], batchSize * OUTPUT_SIZE * sizeof(float)));
+
+    //stream
+    cudaStream_t stream;
+    CHECK(cudaStreamCreate(&stream));
+
+    CHECK(cudaMemcpyAsync(buffers[inputIndex], input, batchSize * 3 * INPUT_H * INPUT_W * sizeof(float), cudaMemcpyHostToDevice));
+    context.enqueue(batchSize, buffers, stream, nullptr);
+    CHECK(cudaMemcpyAsync(buffers[outputIndex], output, batchSize * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
+    cudaStreamSynchronize(stream);
+
+    cudaStreamDestroy(stream);
+    CHECK(cudaFree(buffers[inputIndex]));
+    CHECK(cudaFree(buffers[outputIndex]));
+
+}
+
+int main (int argc, char** argv) {
     if (argc == 1) {
         cerr << "Invalid argument" <<  endl;
         return -1;
     }
+
+    char *trtModelStream{nullptr};
+    size_t size;
 
     if (string(argv[1]) == "-g") {
         // build engine
@@ -266,7 +297,7 @@ int main (int argc, char* argv) {
         if (!f) {
             cerr << "engine file error" << endl;
         }
-        f.write(reinterpret_cast<const char*>(modelStream->data(), modelStream->size()));
+        f.write(reinterpret_cast<const char*>(modelStream->data()), modelStream->size());
 
         cout << "engine file generated." << endl;
 
@@ -274,8 +305,60 @@ int main (int argc, char* argv) {
 
         return 0;
 
+    } else {
+        ifstream file("driver_status_detection_mobile_v2.engine", ios::binary);
+        if (file.good()) {
+            file.seekg(0, file.end);
+            size = file.tellg();
+            file.seekg(0, file.beg);
+            trtModelStream = new char[size];
+            assert(trtModelStream);
+            file.read(trtModelStream, size);
+            file.close();
+        } else {
+            cerr << "engine file error." << endl;
+            return -1;
+        }
     }
-    char *trtModelStream{nullptr};
-    size_t size;
+    static float data[3 * INPUT_H * INPUT_W];
+    for (float & i : data) {
+        i = 1.0;
+    }
+    string imageName = argv[2];
+    cv::Mat im = cv::imread(imageName);
+    if (im.empty()) {
+        cerr << "image file is wrong." << endl;
+    }
+//    cv::normalize(im, im, 1.0, 0.0, cv::NORM_MINMAX);
+//    unsigned vol = INPUT_W * INPUT_H * 3;
+//    auto *fileDataChar = (uchar*) malloc(sizeof(uchar) * INPUT_W * INPUT_H * 3);
+//    fileDataChar = im.data;
+//    for (int i = 0; i < vol; ++i) {
+//        data[i] = (float)fileDataChar[i] * 1.0;
+//    }
+    float *pData = &data[0];
+    for (int i = 0; i < INPUT_H * INPUT_W; ++i) {
+        pData[i] = im.at<cv::Vec3b>(i)[0] / 255.0;
+        pData[i + INPUT_H * INPUT_W] = im.at<cv::Vec3b>(i)[1] / 255.0;
+        pData[i + 2 * INPUT_H * INPUT_W] = im.at<cv::Vec3b>(i)[2] / 255.0;
+    }
+
+    IRuntime *runtime = createInferRuntime(gLogger);
+    assert(runtime != nullptr);
+
+    ICudaEngine *engine = runtime->deserializeCudaEngine(trtModelStream, size, nullptr);
+    assert(engine != nullptr);
+
+    IExecutionContext *context = engine->createExecutionContext();
+    assert(context != nullptr);
+
+    delete[] trtModelStream;
+
+    // run inference
+    static float prob[OUTPUT_SIZE];
+    auto start = chrono::system_clock::now();
+    doInference(*context, data, prob, 1);
+    auto end  = chrono::system_clock::now();
+    cout << chrono::duration_cast<chrono::milliseconds>(end - start).count() << "ms" << endl;
     return 0;
 }
