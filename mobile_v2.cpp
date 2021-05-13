@@ -324,7 +324,7 @@ int main (int argc, char** argv) {
         APIToModel(&modelStream, 1);
         assert(modelStream != nullptr);
 
-        ofstream f("driver_status_detection_mobile_v2.engine", ios::binary);
+        ofstream f("driver_status_detection_mobile_v2.trt", ios::binary);
         if (!f) {
             cerr << "engine file error" << endl;
         }

@@ -18,10 +18,12 @@ static const char* trtName = "driver_status_detection_mobile_v2.trt";
 
 static Logger gLogger;
 
+const static auto explicitBatch = 1U << static_cast<uint32_t>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+
 void transform(const string &onnxFile) {
     // load onnx file
     IBuilder *builder = createInferBuilder(gLogger);
-    INetworkDefinition *network = builder->createNetworkV2(0U);
+    INetworkDefinition *network = builder->createNetworkV2(explicitBatch);
     IParser *parser = createParser(*network, gLogger);
     parser->parseFromFile(onnxFile.c_str(), static_cast<int>(Logger::Severity::kWARNING));
     for (int i = 0; i < parser->getNbErrors(); ++i) {
