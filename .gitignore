@@ -3,3 +3,4 @@ weights/
 *.engine
 cmake-build-debug/
 *.wts
+*.onnx

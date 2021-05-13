@@ -8,7 +8,6 @@
 #include <fstream>
 #include <iostream>
 #include <map>
-#include <sstream>
 #include <vector>
 #include <chrono>
 #include <cmath>
@@ -16,7 +15,6 @@
 #include "opencv2/core.hpp"
 #include "opencv2/imgproc.hpp"
 #include "opencv2/highgui.hpp"
-#include "opencv2/videoio.hpp"
 
 #define CHECK(status) \
     do { \
@@ -113,7 +111,7 @@ ILayer *convBNReLU(INetworkDefinition *network, map<string, Weights> weightMap, 
     IActivationLayer *relu1 = network->addActivation(*bn->getOutput(0), ActivationType::kRELU);
     assert(relu1);
 
-    float *shval = reinterpret_cast<float*>(malloc(sizeof(float ) * 1));
+    float *shval = reinterpret_cast<float*>(malloc(sizeof(float) * 1));
     float *scval = reinterpret_cast<float*>(malloc(sizeof(float) * 1));
     float *pval = reinterpret_cast<float*>(malloc(sizeof(float) * 1));
     shval[0] = -6.0;

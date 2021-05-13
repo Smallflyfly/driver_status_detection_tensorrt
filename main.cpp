@@ -58,9 +58,6 @@ map<string, Weights> loadWeight(const string& weightFile) {
         input >> name >> dec >> size;
         wt.type = DataType::kFLOAT;
         wt.count = size;
-        if (size == 432) {
-            cout << name << endl;
-        }
         // val
         uint32_t  *val = reinterpret_cast<uint32_t*>(malloc(sizeof(val) * size));
         for (uint32_t i = 0; i < size; i++) {
