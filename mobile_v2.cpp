@@ -146,7 +146,7 @@ ILayer *invertRes(INetworkDefinition *network, map<string, Weights> weightMap, I
         ILayer *conv2 = convBNReLU(network,weightMap, *conv1->getOutput(0), hiddenDim, 3, stride, hiddenDim, layerName + ".conv.1");
         IConvolutionLayer *conv3 = network->addConvolutionNd(*conv2->getOutput(0), outCh, DimsHW{1, 1}, weightMap[layerName + ".conv.2.weight"], emptyWt);
         assert(conv3);
-        bn = addBN2d(network, *conv3->getOutput(0), weightMap, layerName + ".conv.3", 1e-5);
+        bn = addBN2d(network,*conv3->getOutput(0), weightMap, layerName + ".conv.3", 1e-5);
 //        tensor = *bn->getOutput(0);
 
     } else {
@@ -160,8 +160,9 @@ ILayer *invertRes(INetworkDefinition *network, map<string, Weights> weightMap, I
         IElementWiseLayer *ew = network->addElementWise(input, *bn->getOutput(0), ElementWiseOperation::kSUM);
         assert(ew);
         return ew;
+    } else {
+        return bn;
     }
-    return bn;
 }
 
 ICudaEngine *createEngine(IBuilder *builder, IBuilderConfig *config, int maxBatchSize) {
@@ -207,7 +208,7 @@ ICudaEngine *createEngine(IBuilder *builder, IBuilderConfig *config, int maxBatc
     ILayer *conv2 = convBNReLU(network, weightMap, *ir17->getOutput(0), 1280, 1, 1, 1, "features.18");
     IPoolingLayer *pool = network->addPoolingNd(*conv2->getOutput(0), PoolingType::kAVERAGE, DimsHW{15, 20});
     assert(pool);
-    pool->setStrideNd(DimsHW{15, 20});
+//    pool->setStrideNd(DimsHW{15, 20});
 
     IFullyConnectedLayer *fc = network->addFullyConnected(*pool->getOutput(0), 10, weightMap["classifier.1.weight"], weightMap["classifier.1.bias"]);
     assert(fc);
@@ -218,7 +219,7 @@ ICudaEngine *createEngine(IBuilder *builder, IBuilderConfig *config, int maxBatc
 
     // build engine
     builder->setMaxBatchSize(maxBatchSize);
-    config->setMaxWorkspaceSize(1<<20);
+    config->setMaxWorkspaceSize(1 << 20);
     ICudaEngine *engine = builder->buildEngineWithConfig(*network, *config);
     assert(engine);
     cout << "engine built." << endl;
@@ -238,7 +239,7 @@ void APIToModel(IHostMemory **modelStream, int maxBatchSize) {
     IBuilder *builder = createInferBuilder(gLogger);
 
     // build config
-    IBuilderConfig * config = builder->createBuilderConfig();
+    IBuilderConfig *config = builder->createBuilderConfig();
 
     // engine
     ICudaEngine *engine = createEngine(builder, config, maxBatchSize);
@@ -267,9 +268,9 @@ void doInference(IExecutionContext &context, float *input, float *output, int ba
     cudaStream_t stream;
     CHECK(cudaStreamCreate(&stream));
 
-    CHECK(cudaMemcpyAsync(buffers[inputIndex], input, batchSize * 3 * INPUT_H * INPUT_W * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpyAsync(buffers[inputIndex], input, batchSize * 3 * INPUT_H * INPUT_W * sizeof(float), cudaMemcpyHostToDevice, stream));
     context.enqueue(batchSize, buffers, stream, nullptr);
-    CHECK(cudaMemcpyAsync(buffers[outputIndex], output, batchSize * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpyAsync(output, buffers[outputIndex], batchSize * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost, stream));
     cudaStreamSynchronize(stream);
 
     cudaStreamDestroy(stream);
